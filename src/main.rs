@@ -34,10 +34,27 @@ struct Cli {
     /// Generate both transformed .json and raw .raw.json files (without transformations)
     #[arg(long)]
     raw: bool,
+
+    /// Extract only this node and its subtree (Figma node id, e.g. 6886:48774 or 6886-48774)
+    #[arg(long, value_name = "ID", value_parser = parse_node_arg)]
+    node: Option<fig2json::schema::NodeId>,
+}
+
+/// clap value parser for `--node`: defers to NodeId's FromStr.
+fn parse_node_arg(s: &str) -> std::result::Result<fig2json::schema::NodeId, String> {
+    s.parse()
 }
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
+
+    // clap parses --node into a NodeId up front (via NodeId's FromStr), so a bad
+    // id fails before any work.
+    let target = cli.node.as_ref();
+
+    if cli.raw && target.is_some() {
+        bail!("--raw cannot be combined with --node (raw output is never node-scoped)");
+    }
 
     if cli.verbose {
         eprintln!("Reading input file: {}", cli.input.display());
@@ -57,15 +74,16 @@ fn main() -> Result<()> {
     // Validate arguments based on file type
     if is_zip {
         // ZIP mode: require extract_dir, forbid -o
-        let extract_dir = cli.extract_dir.as_ref()
-            .ok_or_else(|| anyhow!("ZIP files require an extraction directory as second argument"))?;
+        let extract_dir = cli.extract_dir.as_ref().ok_or_else(|| {
+            anyhow!("ZIP files require an extraction directory as second argument")
+        })?;
 
         if cli.output.is_some() {
             bail!("Cannot use -o/--output flag with extraction directory (ZIP mode)");
         }
 
         // ZIP extraction mode
-        handle_zip_mode(&bytes, extract_dir, cli.compact, cli.verbose, cli.raw)?;
+        handle_zip_mode(&bytes, extract_dir, cli.compact, cli.verbose, cli.raw, target)?;
     } else {
         // Regular .fig file mode
         if cli.verbose {
@@ -80,7 +98,8 @@ fn main() -> Result<()> {
             Some(std::path::Path::new("."))
         };
 
-        let json = fig2json::convert(&bytes, base_dir).context("Failed to convert .fig file to JSON")?;
+        let json = fig2json::convert_node(&bytes, base_dir, target)
+            .context("Failed to convert .fig file to JSON")?;
 
         if cli.verbose {
             eprintln!("Conversion successful!");
@@ -116,7 +135,8 @@ fn main() -> Result<()> {
                 eprintln!("Converting to raw JSON...");
             }
 
-            let raw_json = fig2json::convert_raw(&bytes).context("Failed to convert .fig file to raw JSON")?;
+            let raw_json =
+                fig2json::convert_raw(&bytes).context("Failed to convert .fig file to raw JSON")?;
 
             let raw_output = if cli.compact {
                 serde_json::to_string(&raw_json)?
@@ -142,8 +162,9 @@ fn main() -> Result<()> {
                 eprintln!("Writing raw output to: {}", raw_path.display());
             }
 
-            fs::write(&raw_path, raw_output)
-                .with_context(|| format!("Failed to write raw output file: {}", raw_path.display()))?;
+            fs::write(&raw_path, raw_output).with_context(|| {
+                format!("Failed to write raw output file: {}", raw_path.display())
+            })?;
 
             if cli.verbose {
                 eprintln!("Raw JSON done!");
@@ -155,9 +176,19 @@ fn main() -> Result<()> {
 }
 
 /// Handle ZIP extraction mode: extract all files and convert all .fig files found
-fn handle_zip_mode(zip_bytes: &[u8], extract_dir: &PathBuf, compact: bool, verbose: bool, raw: bool) -> Result<()> {
+fn handle_zip_mode(
+    zip_bytes: &[u8],
+    extract_dir: &PathBuf,
+    compact: bool,
+    verbose: bool,
+    raw: bool,
+    target: Option<&fig2json::schema::NodeId>,
+) -> Result<()> {
     if verbose {
-        eprintln!("ZIP file detected - extracting to: {}", extract_dir.display());
+        eprintln!(
+            "ZIP file detected - extracting to: {}",
+            extract_dir.display()
+        );
     }
 
     // Extract entire ZIP to directory
@@ -182,10 +213,13 @@ fn handle_zip_mode(zip_bytes: &[u8], extract_dir: &PathBuf, compact: bool, verbo
         eprintln!("Found {} .fig file(s)", file_count);
     }
 
+    // Count files actually converted (a node target skips files that lack it),
+    // so reporting reflects what was written rather than what was found.
+    let mut converted = 0usize;
+
     // Convert each .fig file
     for fig_path in fig_files {
-        let relative_path = fig_path.strip_prefix(extract_dir)
-            .unwrap_or(&fig_path);
+        let relative_path = fig_path.strip_prefix(extract_dir).unwrap_or(&fig_path);
 
         if verbose {
             eprintln!("Converting: {}", relative_path.display());
@@ -198,9 +232,21 @@ fn handle_zip_mode(zip_bytes: &[u8], extract_dir: &PathBuf, compact: bool, verbo
         // Determine base directory for image file operations (parent of .fig file)
         let base_dir = fig_path.parent();
 
-        // Convert to JSON
-        let json = fig2json::convert(&fig_bytes, base_dir)
-            .with_context(|| format!("Failed to convert: {}", fig_path.display()))?;
+        // Convert to JSON. With a target, skip files that don't contain the node
+        // so a multi-canvas archive still yields the one file that does.
+        let json = match fig2json::convert_node(&fig_bytes, base_dir, target) {
+            Ok(json) => json,
+            Err(fig2json::FigError::NodeNotFound(_)) if target.is_some() => {
+                if verbose {
+                    eprintln!("  (node not in {}, skipping)", relative_path.display());
+                }
+                continue;
+            }
+            Err(e) => {
+                return Err(e).with_context(|| format!("Failed to convert: {}", fig_path.display()))
+            }
+        };
+        converted += 1;
 
         // Format output (pretty by default, compact if flag is set)
         let output = if compact {
@@ -217,13 +263,20 @@ fn handle_zip_mode(zip_bytes: &[u8], extract_dir: &PathBuf, compact: bool, verbo
             .with_context(|| format!("Failed to write output: {}", output_path.display()))?;
 
         if verbose {
-            eprintln!("  → {}", output_path.strip_prefix(extract_dir).unwrap_or(&output_path).display());
+            eprintln!(
+                "  → {}",
+                output_path
+                    .strip_prefix(extract_dir)
+                    .unwrap_or(&output_path)
+                    .display()
+            );
         }
 
         // If --raw flag is set, also generate raw JSON file
         if raw {
-            let raw_json = fig2json::convert_raw(&fig_bytes)
-                .with_context(|| format!("Failed to convert to raw JSON: {}", fig_path.display()))?;
+            let raw_json = fig2json::convert_raw(&fig_bytes).with_context(|| {
+                format!("Failed to convert to raw JSON: {}", fig_path.display())
+            })?;
 
             let raw_output = if compact {
                 serde_json::to_string(&raw_json)?
@@ -235,17 +288,35 @@ fn handle_zip_mode(zip_bytes: &[u8], extract_dir: &PathBuf, compact: bool, verbo
             let raw_output_path = fig_path.with_extension("raw.json");
 
             // Write raw JSON file
-            fs::write(&raw_output_path, raw_output)
-                .with_context(|| format!("Failed to write raw output: {}", raw_output_path.display()))?;
+            fs::write(&raw_output_path, raw_output).with_context(|| {
+                format!("Failed to write raw output: {}", raw_output_path.display())
+            })?;
 
             if verbose {
-                eprintln!("  → {}", raw_output_path.strip_prefix(extract_dir).unwrap_or(&raw_output_path).display());
+                eprintln!(
+                    "  → {}",
+                    raw_output_path
+                        .strip_prefix(extract_dir)
+                        .unwrap_or(&raw_output_path)
+                        .display()
+                );
             }
         }
     }
 
+    if let Some(id) = target {
+        if converted == 0 {
+            bail!("node {id} not found in any .fig in the archive");
+        }
+    }
+
     if verbose {
-        eprintln!("Done! Converted {} file(s)", file_count);
+        let skipped = file_count - converted;
+        if target.is_some() && skipped > 0 {
+            eprintln!("Done! Converted {converted} file(s); skipped {skipped} without the node");
+        } else {
+            eprintln!("Done! Converted {converted} file(s)");
+        }
     }
 
     Ok(())

@@ -118,6 +118,20 @@ pub use types::{FileType, ParsedFile};
 /// println!("{}", serde_json::to_string_pretty(&json).unwrap());
 /// ```
 pub fn convert(bytes: &[u8], base_dir: Option<&std::path::Path>) -> Result<serde_json::Value> {
+    convert_node(bytes, base_dir, None)
+}
+
+/// Convert a .fig file to JSON, optionally scoped to a single node.
+///
+/// Identical to [`convert`], but when `target` is set the document is reduced to
+/// that node's subtree (matched by its `guid`) before the transformation passes
+/// run — so the output is just that frame, optimized. Returns
+/// [`FigError::NodeNotFound`] when no node matches.
+pub fn convert_node(
+    bytes: &[u8],
+    base_dir: Option<&std::path::Path>,
+    target: Option<&schema::NodeId>,
+) -> Result<serde_json::Value> {
     // 1. Detect and extract from ZIP if needed
     let bytes = if parser::is_zip_container(bytes) {
         parser::extract_from_zip(bytes)?
@@ -156,6 +170,14 @@ pub fn convert(bytes: &[u8], base_dir: Option<&std::path::Path>) -> Result<serde
         .clone();
 
     let mut document = schema::build_tree(node_changes)?;
+
+    // 6b. Scope to a single node's subtree when a target is given. Done here,
+    // while guids are still present and before the transformation passes, so the
+    // rest of the pipeline only processes the targeted frame.
+    if let Some(id) = target {
+        document =
+            schema::find_node(&document, id).ok_or_else(|| FigError::NodeNotFound(id.clone()))?;
+    }
 
     // 7. Extract and process blobs (convert to base64)
     let blobs = json

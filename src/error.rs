@@ -24,6 +24,11 @@ pub enum FigError {
     #[error("Canvas file not found in ZIP archive")]
     CanvasNotFoundInZip,
 
+    /// Recoverable in ZIP mode: when `--node` is set it is caught per-file to
+    /// skip archives lacking the node; only fatal if no file contains it.
+    #[error("Node {0} not found in document")]
+    NodeNotFound(crate::schema::NodeId),
+
     #[error("IO error: {0}")]
     IoError(#[from] std::io::Error),
 
